@@ -1,0 +1,27 @@
+# Environment & secrets
+.env
+*.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.pkl
+*.egg-info/
+
+# Data files (too large for git)
+data/
+backend/ml/saved_models/
+*.csv
+
+# Docker volumes
+postgres_data/
+redis_data/
+
+# VS Code
+.vscode/
+
+# Logs
+*.log
