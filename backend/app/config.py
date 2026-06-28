@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     # ─── Database ────────────────────────────────────────────
     database_url: str = "postgresql+asyncpg://football:football@localhost:5432/football_db"
     database_url_sync: str = "postgresql://football:football@localhost:5432/football_db"
+    database_url_async: str = ""  # Railway-safe override for async engine
 
     # ─── Redis ───────────────────────────────────────────────
     redis_url: str = "redis://localhost:6379/0"
@@ -44,6 +45,18 @@ class Settings(BaseSettings):
     # ─── ML ──────────────────────────────────────────────────
     model_dir: str = "./ml/saved_models"
     value_bet_edge_threshold: float = 0.10
+
+    @property
+    def async_database_url(self) -> str:
+        """Returns the correct async DB URL, preferring DATABASE_URL_ASYNC if set."""
+        if self.database_url_async:
+            url = self.database_url_async
+        else:
+            url = self.database_url
+        # Ensure it uses asyncpg driver
+        if url.startswith("postgresql://"):
+            url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
+        return url
 
     @property
     def cors_origins_list(self) -> list[str]:

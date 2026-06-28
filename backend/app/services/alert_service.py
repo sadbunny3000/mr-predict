@@ -10,18 +10,17 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# Edge thresholds
-BET_THIS_THRESHOLD = 0.10   # 10%+
-CONSIDER_THRESHOLD = 0.05   # 5-9%
+# Edge thresholds — lowered to catch 1-5% edges
+BET_THIS_THRESHOLD = 0.03   # 3%+
+CONSIDER_THRESHOLD = 0.01   # 1-2%
 
-# Bookmakers we track (Namibia-focused)
-BOOKMAKERS = ["castlebet", "easybetnam", "williamhill", "1xbet"]
+# Bookmakers we track
+BOOKMAKERS = ["williamhill", "1xbet"]
 
 BOOKMAKER_DISPLAY = {
-    "castlebet": "CastleBet",
-    "easybetnam": "EasyBet NAM",
     "williamhill": "William Hill",
     "1xbet": "1xBet",
+    "onexbet": "1xBet",
 }
 
 
@@ -43,25 +42,22 @@ class ValueAlert:
     bet_this: list[OddsLine]
     consider: list[OddsLine]
     no_value: list[str]
-    best_odds: dict  # outcome → best bookmaker + odds
+    best_odds: dict
 
 
 def implied_probability(odds: float) -> float:
-    """Convert decimal odds to implied probability."""
     if not odds or odds <= 1.0:
         return 0.0
     return round(1 / odds, 4)
 
 
 def fair_odds(prob: float) -> float:
-    """Convert probability to fair decimal odds."""
     if not prob or prob <= 0:
         return 0.0
     return round(1 / prob, 2)
 
 
 def edge(model_prob: float, implied_prob: float) -> float:
-    """Calculate edge as model_prob - implied_prob."""
     return round(model_prob - implied_prob, 4)
 
 
@@ -79,40 +75,22 @@ def build_alert(
     match_date: datetime,
     league: str,
     prediction: dict,
-    odds_by_bookmaker: dict,  # {"bookmaker": {"home": 1.8, "draw": 3.5, "away": 2.1, "over25": 1.9, ...}}
+    odds_by_bookmaker: dict,
 ) -> Optional[ValueAlert]:
-    """
-    Build a value alert by comparing model predictions against all bookmaker odds.
-    Returns None if no value found anywhere.
-    """
     match_name = f"{home_team} vs {away_team}"
 
-    # Define all markets we can evaluate
     markets = []
-
     if "home_win_prob" in prediction:
         markets.append(("Home Win", "home", prediction["home_win_prob"]))
         markets.append(("Draw", "draw", prediction["draw_prob"]))
         markets.append(("Away Win", "away", prediction["away_win_prob"]))
-
     if "over_25_prob" in prediction:
         markets.append(("Over 2.5 Goals", "over25", prediction["over_25_prob"]))
         markets.append(("Under 2.5 Goals", "under25", prediction.get("under_25_prob", 0)))
-
-    if "corners_ht_pred" in prediction:
-        ht = prediction["corners_ht_pred"]
-        threshold = round(ht - 0.5)
-        markets.append((f"Over {threshold} Corners (1st Half)", "corners_ht_over", 0.60))
-
-    if "corners_ft_pred" in prediction:
-        ft = prediction["corners_ft_pred"]
-        threshold = round(ft - 0.5)
-        markets.append((f"Over {threshold} Corners (90 min)", "corners_ft_over", 0.60))
-
-    if "corners_2h_pred" in prediction:
-        half2 = prediction["corners_2h_pred"]
-        threshold = round(half2 - 0.5)
-        markets.append((f"Over {threshold} Corners (2nd Half)", "corners_2h_over", 0.60))
+    if "corners_over_9_5_prob" in prediction:
+        markets.append(("Over 9.5 Corners (90 min)", "corners_over_9_5", prediction["corners_over_9_5_prob"]))
+    if "corners_over_10_5_prob" in prediction:
+        markets.append(("Over 10.5 Corners (90 min)", "corners_over_10_5", prediction["corners_over_10_5_prob"]))
 
     bet_this = []
     consider = []
@@ -120,7 +98,7 @@ def build_alert(
     best_odds = {}
 
     for market_name, market_key, model_prob in markets:
-        best_edge = -999
+        best_edge_val = -999
         best_bookmaker = None
         best_odds_val = None
         all_lines = []
@@ -129,11 +107,9 @@ def build_alert(
             bk_odds_val = bk_odds.get(market_key)
             if not bk_odds_val:
                 continue
-
             imp_prob = implied_probability(bk_odds_val)
             edge_val = edge(model_prob, imp_prob)
             rating = rate_edge(edge_val)
-
             line = OddsLine(
                 bookmaker=BOOKMAKER_DISPLAY.get(bk_key, bk_key),
                 outcome=market_name,
@@ -143,40 +119,37 @@ def build_alert(
                 rating=rating,
             )
             all_lines.append(line)
-
             if bk_odds_val > (best_odds_val or 0):
                 best_odds_val = bk_odds_val
                 best_bookmaker = BOOKMAKER_DISPLAY.get(bk_key, bk_key)
-
-            if edge_val > best_edge:
-                best_edge = edge_val
+            if edge_val > best_edge_val:
+                best_edge_val = edge_val
 
         if not all_lines:
             continue
 
-        best_line = max(all_lines, key=lambda x: x.odds)
         best_odds[market_key] = {"bookmaker": best_bookmaker, "odds": best_odds_val}
 
-        if best_edge >= BET_THIS_THRESHOLD:
+        if best_edge_val >= BET_THIS_THRESHOLD:
             bet_this.append(OddsLine(
                 bookmaker=best_bookmaker,
                 outcome=market_name,
                 odds=best_odds_val,
                 implied_prob=implied_probability(best_odds_val),
-                edge=best_edge,
+                edge=best_edge_val,
                 rating="BET_THIS",
             ))
-        elif best_edge >= CONSIDER_THRESHOLD:
+        elif best_edge_val >= CONSIDER_THRESHOLD:
             consider.append(OddsLine(
                 bookmaker=best_bookmaker,
                 outcome=market_name,
                 odds=best_odds_val,
                 implied_prob=implied_probability(best_odds_val),
-                edge=best_edge,
+                edge=best_edge_val,
                 rating="CONSIDER",
             ))
         else:
-            no_value.append(f"{market_name} — {round(best_edge*100, 1)}% edge, skip")
+            no_value.append(f"{market_name} — {round(best_edge_val*100, 1)}% edge, skip")
 
     if not bet_this and not consider:
         return None
@@ -193,33 +166,26 @@ def build_alert(
 
 
 def format_telegram_message(alert: ValueAlert, prediction: dict) -> str:
-    """Format alert into your exact Telegram message format."""
     date_str = alert.match_date.strftime("%A %d %B, %I:%M %p")
     lines = []
-
     lines.append("🔥 VALUE BET ALERT")
     lines.append(f"Match: {alert.match}")
     lines.append(f"Date: {date_str}")
     lines.append(f"League: {alert.league}")
     lines.append("")
 
-    # Group bet_this and consider by type
-    corner_bets = [b for b in alert.bet_this + alert.consider
-                   if "Corner" in b.outcome or "corner" in b.outcome.lower()]
-    outcome_bets = [b for b in alert.bet_this + alert.consider
-                    if b.outcome in ("Home Win", "Draw", "Away Win")]
-    goals_bets = [b for b in alert.bet_this + alert.consider
-                  if "Goal" in b.outcome]
+    corner_bets = [b for b in alert.bet_this + alert.consider if "Corner" in b.outcome]
+    outcome_bets = [b for b in alert.bet_this + alert.consider if b.outcome in ("Home Win", "Draw", "Away Win")]
+    goals_bets = [b for b in alert.bet_this + alert.consider if "Goal" in b.outcome]
 
     if corner_bets:
         lines.append("📊 CORNERS")
         for b in corner_bets:
-            model_prob = 0.60  # default if not available
             emoji = "✅ BET THIS" if b.rating == "BET_THIS" else "🟡 CONSIDER"
             lines.append(f"{b.outcome}")
-            lines.append(f"Your model: {round(b.implied_prob*100 + b.edge*100)}% → Fair odds: {fair_odds(b.implied_prob + b.edge)}")
+            lines.append(f"Your model: {round((b.implied_prob + b.edge)*100)}% → Fair odds: {fair_odds(b.implied_prob + b.edge)}")
             lines.append(f"Bookmaker: {round(b.implied_prob*100)}% → Their odds: {b.odds}")
-            lines.append(f"Edge: {round(b.edge*100)}% {emoji}")
+            lines.append(f"Edge: {round(b.edge*100, 1)}% {emoji}")
             lines.append(f"👉 Best odds: {b.bookmaker} at {b.odds}")
             lines.append("")
 
@@ -231,7 +197,7 @@ def format_telegram_message(alert: ValueAlert, prediction: dict) -> str:
             lines.append(f"{b.outcome}")
             lines.append(f"Your model: {model_prob_pct}% → Fair odds: {fair_odds(b.implied_prob + b.edge)}")
             lines.append(f"Bookmaker: {round(b.implied_prob*100)}% → Their odds: {b.odds}")
-            lines.append(f"Edge: {round(b.edge*100)}% {emoji}")
+            lines.append(f"Edge: {round(b.edge*100, 1)}% {emoji}")
             lines.append(f"👉 Best odds: {b.bookmaker} at {b.odds}")
             lines.append("")
 
@@ -243,7 +209,7 @@ def format_telegram_message(alert: ValueAlert, prediction: dict) -> str:
             lines.append(f"{b.outcome}")
             lines.append(f"Your model: {model_prob_pct}% → Fair odds: {fair_odds(b.implied_prob + b.edge)}")
             lines.append(f"Bookmaker: {round(b.implied_prob*100)}% → Their odds: {b.odds}")
-            lines.append(f"Edge: {round(b.edge*100)}% {emoji}")
+            lines.append(f"Edge: {round(b.edge*100, 1)}% {emoji}")
             lines.append(f"👉 Best odds: {b.bookmaker} at {b.odds}")
             lines.append("")
 
@@ -256,7 +222,6 @@ def format_telegram_message(alert: ValueAlert, prediction: dict) -> str:
 
 
 async def send_telegram_alert(message: str, bot_token: str, chat_id: str) -> bool:
-    """Send alert to Telegram."""
     import httpx
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     try:
@@ -267,7 +232,6 @@ async def send_telegram_alert(message: str, bot_token: str, chat_id: str) -> boo
                 "parse_mode": "HTML",
             })
             response.raise_for_status()
-            logger.info("Telegram alert sent successfully")
             return True
     except Exception as e:
         logger.error(f"Failed to send Telegram alert: {e}")
