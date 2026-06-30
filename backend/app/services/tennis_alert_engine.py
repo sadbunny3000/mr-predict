@@ -210,7 +210,7 @@ def _format_message(p1, p2, winner, confidence, p1_prob, p2_prob,
 async def run_tennis_alert_engine(db: AsyncSession) -> dict:
     bot_token = os.getenv('TELEGRAM_BOT_TOKEN', '')
     chat_id   = os.getenv('TELEGRAM_CHAT_ID', '')
-    api_key   = os.getenv('ODDS_API_KEY', '')
+    api_key   = os.getenv('TENNIS_ODDS_API_KEY') or os.getenv('ODDS_API_KEY', '')
 
     now          = datetime.now(timezone.utc)
     window_start = now
