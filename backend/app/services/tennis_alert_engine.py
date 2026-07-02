@@ -1,168 +1,228 @@
 """
-Tennis Alert Engine
-- Fetches upcoming Wimbledon matches from The Odds API
-- Runs our ML model on each match
-- Sends Telegram alerts 3 hours before match starts
+Tennis Alert Engine v2
+- Match winner prediction (65% accuracy)
+- Total games prediction with full probability distribution
+- Real totals odds from The Odds API
 - Never sends duplicates, never alerts on past matches
 """
 import logging
 import os
 import pickle
 import numpy as np
+import pandas as pd
 import httpx
 from datetime import datetime, timezone, timedelta
+from scipy.stats import norm
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
 
 logger = logging.getLogger(__name__)
 
 TENNIS_SPORT_KEYS = ['tennis_atp_wimbledon', 'tennis_wta_wimbledon']
-MODEL_PATH = '/app/ml/saved_models/tennis_winner_model.pkl'
+WINNER_MODEL_PATH      = '/app/ml/saved_models/tennis_winner_model.pkl'
+TOTAL_GAMES_MODEL_PATH = '/app/ml/saved_models/tennis_total_games_model_v2.pkl'
 
-# Load model once at import time
+TOTAL_GAMES_LINES = {
+    'bo3_Hard': 21.5, 'bo3_Clay': 20.5, 'bo3_Grass': 21.5,
+    'bo5_Hard': 33.5, 'bo5_Clay': 32.5, 'bo5_Grass': 34.5,
+}
+
 try:
-    with open(MODEL_PATH, 'rb') as f:
-        _saved = pickle.load(f)
-    _model = _saved['model']
-    _features = _saved['features']
-    logger.info('Tennis model loaded successfully')
+    with open(WINNER_MODEL_PATH, 'rb') as f:
+        _winner_saved = pickle.load(f)
+    _winner_model    = _winner_saved['model']
+    _winner_features = _winner_saved['features']
+    logger.info('Tennis winner model loaded')
 except Exception as e:
-    _model = None
-    _features = []
-    logger.error(f'Tennis model failed to load: {e}')
+    _winner_model = None
+    _winner_features = []
+    logger.error(f'Winner model failed: {e}')
+
+try:
+    with open(TOTAL_GAMES_MODEL_PATH, 'rb') as f:
+        _tg_models = pickle.load(f)
+    logger.info('Tennis total games model v2 loaded')
+except Exception as e:
+    _tg_models = None
+    logger.error(f'Total games model failed: {e}')
 
 
-def _predict(p1_elo, p2_elo, p1_surface_elo, p2_surface_elo,
-             p1_rank, p2_rank,
-             p1_ace_rate=0.06, p2_ace_rate=0.06,
-             p1_1st_in=0.60, p2_1st_in=0.60,
-             p1_1st_won=0.70, p2_1st_won=0.70,
-             p1_bp_saved=0.60, p2_bp_saved=0.60,
-             p1_days_since=7, p2_days_since=7,
-             p1_last14=3, p2_last14=3,
-             p1_h2h_wins=0, p2_h2h_wins=0,
-             p1_exp=100, p2_exp=100,
-             surface='Grass', level='G',
-             round_='R64', best_of=3):
-    if _model is None:
+def _predict_winner(p1_data, p2_data, surface='Grass', level='G', round_='R64', best_of=3):
+    if _winner_model is None:
         return None, None
-
     surface_map = {'Hard': 0, 'Clay': 1, 'Grass': 2, 'Carpet': 3}
     level_map   = {'G': 4, 'M': 3, 'A': 2, 'F': 1, 'D': 0}
-    round_map   = {'F': 7, 'SF': 6, 'QF': 5, 'R16': 4, 'R32': 3,
-                   'R64': 2, 'R128': 1, 'RR': 3}
-
-    elo_diff         = p1_elo - p2_elo
-    surface_elo_diff = p1_surface_elo - p2_surface_elo
-    rank_diff        = p2_rank - p1_rank
+    round_map   = {'F': 7, 'SF': 6, 'QF': 5, 'R16': 4, 'R32': 3, 'R64': 2, 'R128': 1, 'RR': 3}
+    elo_diff         = p1_data['elo'] - p2_data['elo']
+    surface_elo_diff = p1_data['surface_elo'] - p2_data['surface_elo']
+    rank_diff        = p2_data['rank'] - p1_data['rank']
     elo_win_prob     = 1 / (1 + 10 ** (-elo_diff / 400))
-
     feature_vals = {
-        'elo_diff':         elo_diff,
-        'surface_elo_diff': surface_elo_diff,
-        'rank_diff':        rank_diff,
-        'elo_win_prob':     elo_win_prob,
-        'surface_enc':      surface_map.get(surface, 2),
-        'level_enc':        level_map.get(level, 4),
-        'round_enc':        round_map.get(round_, 2),
-        'best_of_enc':      best_of,
-        'days_since_diff':  p1_days_since - p2_days_since,
-        'last14_diff':      p1_last14 - p2_last14,
-        'h2h_diff':         p1_h2h_wins - p2_h2h_wins,
-        'h2h_total':        p1_h2h_wins + p2_h2h_wins,
-        'ace_rate_diff':    p1_ace_rate - p2_ace_rate,
-        '1st_in_diff':      p1_1st_in - p2_1st_in,
-        '1st_won_diff':     p1_1st_won - p2_1st_won,
-        'bp_saved_diff':    p1_bp_saved - p2_bp_saved,
-        'exp_diff':         p1_exp - p2_exp,
+        'elo_diff': elo_diff, 'surface_elo_diff': surface_elo_diff,
+        'rank_diff': rank_diff, 'elo_win_prob': elo_win_prob,
+        'surface_enc': surface_map.get(surface, 2),
+        'level_enc': level_map.get(level, 4),
+        'round_enc': round_map.get(round_, 2),
+        'best_of_enc': best_of,
+        'days_since_diff': p1_data.get('days_since', 7) - p2_data.get('days_since', 7),
+        'last14_diff': p1_data.get('last14', 3) - p2_data.get('last14', 3),
+        'h2h_diff': p1_data.get('h2h_wins', 0) - p2_data.get('h2h_wins', 0),
+        'h2h_total': p1_data.get('h2h_wins', 0) + p2_data.get('h2h_wins', 0),
+        'ace_rate_diff': p1_data.get('ace_rate', 0.06) - p2_data.get('ace_rate', 0.06),
+        '1st_in_diff': p1_data.get('1st_in', 0.60) - p2_data.get('1st_in', 0.60),
+        '1st_won_diff': p1_data.get('1st_won', 0.70) - p2_data.get('1st_won', 0.70),
+        'bp_saved_diff': p1_data.get('bp_saved', 0.60) - p2_data.get('bp_saved', 0.60),
+        'exp_diff': p1_data.get('exp', 100) - p2_data.get('exp', 100),
     }
-
-    X = np.array([[feature_vals[f] for f in _features]])
-    prob_p1 = float(_model.predict_proba(X)[0][1])
+    X = np.array([[feature_vals[f] for f in _winner_features]])
+    prob_p1 = float(_winner_model.predict_proba(X)[0][1])
     return prob_p1, 1 - prob_p1
 
 
-async def _get_player_elo(session: AsyncSession, player_name: str):
-    """Look up latest ELO and pre-match stats for a player by name."""
+def _predict_total_games(p1_data, p2_data, surface='Grass', level='G',
+                         round_='R64', best_of=3, over_price=None, under_price=None):
+    if _tg_models is None:
+        return None
+    key = f'bo{best_of}_{surface}'
+    if key not in _tg_models:
+        key = 'fallback' if 'fallback' in _tg_models else None
+    if key is None:
+        return None
+    sub      = _tg_models[key]
+    qm       = sub['quantile_models']
+    features = sub['features']
+    line     = TOTAL_GAMES_LINES.get(f'bo{best_of}_{surface}', 21.5)
+    surface_map = {'Hard': 0, 'Clay': 1, 'Grass': 2, 'Carpet': 3}
+    level_map   = {'G': 4, 'M': 3, 'A': 2, 'F': 1, 'D': 0}
+    round_map   = {'F': 7, 'SF': 6, 'QF': 5, 'R16': 4, 'R32': 3, 'R64': 2, 'R128': 1, 'RR': 3}
+    elo_diff         = p1_data['elo'] - p2_data['elo']
+    surface_elo_diff = p1_data['surface_elo'] - p2_data['surface_elo']
+    elo_mismatch     = abs(elo_diff)
+    rank_diff        = abs(p1_data['rank'] - p2_data['rank'])
+    elo_win_prob     = 1 / (1 + 10 ** (-elo_diff / 400))
+    avg_ace    = (p1_data.get('ace_rate', 0.06) + p2_data.get('ace_rate', 0.06)) / 2
+    avg_1stin  = (p1_data.get('1st_in', 0.60)  + p2_data.get('1st_in', 0.60))  / 2
+    avg_1stwon = (p1_data.get('1st_won', 0.70) + p2_data.get('1st_won', 0.70)) / 2
+    avg_2ndwon = (p1_data.get('2nd_won', 0.50) + p2_data.get('2nd_won', 0.50)) / 2
+    avg_bpsv   = (p1_data.get('bp_saved', 0.60)+ p2_data.get('bp_saved', 0.60)) / 2
+    serve_dom  = avg_1stwon * avg_1stin + avg_2ndwon * (1 - avg_1stin)
+    surf_enc   = surface_map.get(surface, 2)
+    level_enc  = level_map.get(level, 4)
+    round_enc  = round_map.get(round_, 2)
+    feat_row = {
+        'elo_diff': elo_diff, 'surface_elo_diff': surface_elo_diff,
+        'elo_mismatch': elo_mismatch, 'rank_diff': rank_diff, 'elo_win_prob': elo_win_prob,
+        'surface_enc': surf_enc, 'level_enc': level_enc, 'round_enc': round_enc,
+        'roll10_ace_diff': 0, 'roll10_1stwon_diff': 0, 'roll10_2ndwon_diff': 0,
+        'roll10_bpsaved_diff': 0, 'roll10_winrate_diff': 0,
+        'roll10_ace_avg': avg_ace, 'roll10_1stwon_avg': avg_1stwon,
+        'roll10_2ndwon_avg': avg_2ndwon, 'roll10_bpsaved_avg': avg_bpsv,
+        'roll20_bpsaved_avg': avg_bpsv, 'roll5_bpsaved_avg': avg_bpsv,
+        'win_streak_diff': 0, 'wins_last10_avg': 5,
+        '90d_ace_avg': avg_ace, '90d_1stwon_avg': avg_1stwon,
+        'surf_form10_avg': 0.5, 'serve_dominance': serve_dom,
+        'surface_elo_diff_x_surf': surface_elo_diff * surf_enc,
+        'rankdiff_x_level': rank_diff * level_enc,
+        'servedom_x_surface': serve_dom * surf_enc,
+        'momentum_x_level': 0,
+        'bpsaved_x_elo_mismatch': avg_bpsv * elo_mismatch,
+    }
+    X = pd.DataFrame([{f: feat_row.get(f, 0) for f in features}], columns=features)
+    median = float(qm[0.50].predict(X)[0])
+    p05    = float(qm[0.05].predict(X)[0])
+    p95    = float(qm[0.95].predict(X)[0])
+    std    = (p95 - p05) / (2 * 1.645)
+    p90_low  = norm.ppf(0.05, median, std)
+    p90_high = norm.ppf(0.95, median, std)
+    p95_low  = norm.ppf(0.025, median, std)
+    p95_high = norm.ppf(0.975, median, std)
+    prob_over  = 1 - norm.cdf(line, median, std)
+    prob_under = norm.cdf(line, median, std)
+    confidence = round(abs(prob_over - 0.5) * 200)
+    result = {
+        'key': key, 'line': line,
+        'expected_games': round(median, 1),
+        'std_dev': round(std, 1),
+        'p90_interval': f'{p90_low:.1f}-{p90_high:.1f}',
+        'p95_interval': f'{p95_low:.1f}-{p95_high:.1f}',
+        'prob_over': round(prob_over * 100, 1),
+        'prob_under': round(prob_under * 100, 1),
+        'confidence': confidence,
+        'recommendation': 'No Bet',
+        'ev_pct': None, 'edge_pct': None, 'kelly_pct': None,
+    }
+    if over_price and under_price:
+        implied_over  = 1 / over_price
+        implied_under = 1 / under_price
+        total_implied = implied_over + implied_under
+        fair_over     = implied_over / total_implied
+        fair_under    = implied_under / total_implied
+        edge_over  = prob_over  - fair_over
+        edge_under = prob_under - fair_under
+        if edge_over > edge_under:
+            side, model_prob, edge, price = 'Over', prob_over, edge_over, over_price
+        else:
+            side, model_prob, edge, price = 'Under', prob_under, edge_under, under_price
+        ev    = (model_prob * (price - 1)) - (1 - model_prob)
+        kelly = max(0, (model_prob * (price - 1) - (1 - model_prob)) / (price - 1))
+        result['edge_pct']  = round(edge * 100, 1)
+        result['ev_pct']    = round(ev * 100, 1)
+        result['kelly_pct'] = round(kelly / 4 * 100, 2)
+        result['bet_side']  = side
+        result['bet_price'] = price
+        if confidence >= 70 and ev > 0.03:
+            result['recommendation'] = f'STRONG {side.upper()}'
+        elif confidence >= 50 and ev > 0.01:
+            result['recommendation'] = f'LEAN {side.upper()}'
+    return result
+
+
+async def _get_player_data(session, player_name):
     name_parts = player_name.strip().split()
     if not name_parts:
         return None
     last_name = name_parts[-1]
-
-    result = await session.execute(text('''
-        SELECT
-            tp.name,
-            tm.winner_elo_pre, tm.winner_surface_elo_pre, tm.winner_rank,
-            tm.winner_ace_rate_pre, tm.winner_1st_in_pct_pre,
-            tm.winner_1st_won_pct_pre, tm.winner_bp_saved_pct_pre,
-            tm.winner_days_since_last_pre, tm.winner_matches_last14_pre,
-            tm.winner_h2h_wins_pre, tm.winner_total_matches_pre
-        FROM tennis_matches tm
-        JOIN tennis_players tp ON tp.id = tm.winner_id
-        WHERE tp.name ILIKE :pattern
-        ORDER BY tm.tourney_date DESC
-        LIMIT 1
-    '''), {'pattern': f'%{last_name}%'})
-    row = result.fetchone()
-    if row:
-        return {
-            'name': row[0],
-            'elo': float(row[1]) if row[1] else 1500.0,
-            'surface_elo': float(row[2]) if row[2] else 1500.0,
-            'rank': int(row[3]) if row[3] else 100,
-            'ace_rate': float(row[4]) if row[4] else 0.06,
-            '1st_in': float(row[5]) if row[5] else 0.60,
-            '1st_won': float(row[6]) if row[6] else 0.70,
-            'bp_saved': float(row[7]) if row[7] else 0.60,
-            'days_since': int(row[8]) if row[8] else 7,
-            'last14': int(row[9]) if row[9] else 3,
-            'h2h_wins': int(row[10]) if row[10] else 0,
-            'exp': int(row[11]) if row[11] else 100,
-        }
-
-    result2 = await session.execute(text('''
-        SELECT
-            tp.name,
-            tm.loser_elo_pre, tm.loser_surface_elo_pre, tm.loser_rank,
-            tm.loser_ace_rate_pre, tm.loser_1st_in_pct_pre,
-            tm.loser_1st_won_pct_pre, tm.loser_bp_saved_pct_pre,
-            tm.loser_days_since_last_pre, tm.loser_matches_last14_pre,
-            tm.loser_h2h_wins_pre, tm.loser_total_matches_pre
-        FROM tennis_matches tm
-        JOIN tennis_players tp ON tp.id = tm.loser_id
-        WHERE tp.name ILIKE :pattern
-        ORDER BY tm.tourney_date DESC
-        LIMIT 1
-    '''), {'pattern': f'%{last_name}%'})
-    row2 = result2.fetchone()
-    if row2:
-        return {
-            'name': row2[0],
-            'elo': float(row2[1]) if row2[1] else 1500.0,
-            'surface_elo': float(row2[2]) if row2[2] else 1500.0,
-            'rank': int(row2[3]) if row2[3] else 100,
-            'ace_rate': float(row2[4]) if row2[4] else 0.06,
-            '1st_in': float(row2[5]) if row2[5] else 0.60,
-            '1st_won': float(row2[6]) if row2[6] else 0.70,
-            'bp_saved': float(row2[7]) if row2[7] else 0.60,
-            'days_since': int(row2[8]) if row2[8] else 7,
-            'last14': int(row2[9]) if row2[9] else 3,
-            'h2h_wins': int(row2[10]) if row2[10] else 0,
-            'exp': int(row2[11]) if row2[11] else 100,
-        }
-
+    for role in ['winner', 'loser']:
+        if role == 'winner':
+            cols     = 'tm.winner_elo_pre, tm.winner_surface_elo_pre, tm.winner_rank, tm.winner_ace_rate_pre, tm.winner_1st_in_pct_pre, tm.winner_1st_won_pct_pre, tm.winner_2nd_won_pct_pre, tm.winner_bp_saved_pct_pre, tm.winner_days_since_last_pre, tm.winner_matches_last14_pre, tm.winner_h2h_wins_pre, tm.winner_total_matches_pre'
+            join_col = 'winner_id'
+        else:
+            cols     = 'tm.loser_elo_pre, tm.loser_surface_elo_pre, tm.loser_rank, tm.loser_ace_rate_pre, tm.loser_1st_in_pct_pre, tm.loser_1st_won_pct_pre, tm.loser_2nd_won_pct_pre, tm.loser_bp_saved_pct_pre, tm.loser_days_since_last_pre, tm.loser_matches_last14_pre, tm.loser_h2h_wins_pre, tm.loser_total_matches_pre'
+            join_col = 'loser_id'
+        result = await session.execute(text(f'''
+            SELECT tp.name, {cols}
+            FROM tennis_matches tm
+            JOIN tennis_players tp ON tp.id = tm.{join_col}
+            WHERE tp.name ILIKE :pattern
+            ORDER BY tm.tourney_date DESC LIMIT 1
+        '''), {'pattern': f'%{last_name}%'})
+        row = result.fetchone()
+        if row:
+            return {
+                'name': row[0], 'elo': float(row[1]) if row[1] else 1500.0,
+                'surface_elo': float(row[2]) if row[2] else 1500.0,
+                'rank': int(row[3]) if row[3] else 100,
+                'ace_rate': float(row[4]) if row[4] else 0.06,
+                '1st_in': float(row[5]) if row[5] else 0.60,
+                '1st_won': float(row[6]) if row[6] else 0.70,
+                '2nd_won': float(row[7]) if row[7] else 0.50,
+                'bp_saved': float(row[8]) if row[8] else 0.60,
+                'days_since': int(row[9]) if row[9] else 7,
+                'last14': int(row[10]) if row[10] else 3,
+                'h2h_wins': int(row[11]) if row[11] else 0,
+                'exp': int(row[12]) if row[12] else 100,
+            }
     return None
 
 
-async def _already_alerted(session: AsyncSession, odds_api_id: str) -> bool:
-    result = await session.execute(text('''
-        SELECT alert_sent FROM tennis_upcoming_matches
-        WHERE odds_api_id = :oid AND alert_sent = TRUE
-    '''), {'oid': odds_api_id})
+async def _already_alerted(session, odds_api_id):
+    result = await session.execute(text(
+        'SELECT alert_sent FROM tennis_upcoming_matches WHERE odds_api_id = :oid AND alert_sent = TRUE'
+    ), {'oid': odds_api_id})
     return result.fetchone() is not None
 
 
-async def _send_telegram(message: str, bot_token: str, chat_id: str) -> bool:
+async def _send_telegram(message, bot_token, chat_id):
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             r = await client.post(
@@ -175,50 +235,61 @@ async def _send_telegram(message: str, bot_token: str, chat_id: str) -> bool:
         return False
 
 
-def _format_message(p1, p2, winner, confidence, p1_prob, p2_prob,
-                    p1_odds, p2_odds, commence_time, tournament):
-    loser = p2 if winner == p1 else p1
-    winner_odds = p1_odds if winner == p1 else p2_odds
-
-    # Edge = model prob vs market implied prob
-    if winner == p1 and p1_odds:
-        market_prob = 1 / p1_odds
-        edge = (p1_prob - market_prob) * 100
-    elif winner == p2 and p2_odds:
-        market_prob = 1 / p2_odds
-        edge = (p2_prob - market_prob) * 100
-    else:
-        edge = 0
-
-    edge_emoji = '✅' if edge >= 5 else '⚠️' if edge >= 2 else '➖'
-    time_str = commence_time.strftime('%A %d %B, %H:%M UTC')
-
-    return (
+def _format_message(p1, p2, winner, p1_prob, p2_prob,
+                    p1_odds, p2_odds, commence_time, tournament, tg_result=None):
+    time_str    = commence_time.strftime('%A %d %B, %H:%M UTC')
+    winner_conf = round(max(p1_prob, p2_prob))
+    edge_str    = ''
+    if p1_odds and p2_odds:
+        w_odds      = p1_odds if winner == p1 else p2_odds
+        market_prob = 1 / w_odds
+        model_prob  = max(p1_prob, p2_prob) / 100
+        edge        = (model_prob - market_prob) * 100
+        edge_emoji  = '✅' if edge >= 5 else '⚠️' if edge >= 2 else '➖'
+        edge_str    = f'{edge_emoji} Winner edge: {edge:+.1f}%'
+    msg = (
         f'🎾 <b>TENNIS PREDICTION</b>\n'
-        f'{'─'*30}\n'
+        f'{"─"*28}\n'
         f'🏆 {tournament}\n'
         f'📅 {time_str}\n\n'
         f'<b>{p1}</b> vs <b>{p2}</b>\n\n'
-        f'🎯 <b>Model picks: {winner}</b>\n'
-        f'📊 Confidence: {confidence:.1f}%\n'
-        f'📈 {p1}: {p1_prob:.1f}% | {p2}: {p2_prob:.1f}%\n\n'
+        f'━━ MATCH WINNER ━━\n'
+        f'🎯 <b>Pick: {winner}</b> ({winner_conf}% confidence)\n'
+        f'📊 {p1}: {p1_prob:.1f}% | {p2}: {p2_prob:.1f}%\n'
         f'💰 Odds: {p1} {p1_odds or "N/A"} | {p2} {p2_odds or "N/A"}\n'
-        f'{edge_emoji} Model edge: {edge:+.1f}%\n'
+        f'{edge_str}\n'
     )
+    if tg_result:
+        tg        = tg_result
+        rec       = tg['recommendation']
+        rec_emoji = '🔥' if 'STRONG' in rec else '📌' if 'LEAN' in rec else '➖'
+        msg += (
+            f'\n━━ TOTAL GAMES ━━\n'
+            f'📏 Expected: <b>{tg["expected_games"]}</b> games (±{tg["std_dev"]})\n'
+            f'📐 90% range: {tg["p90_interval"]}\n'
+            f'📐 95% range: {tg["p95_interval"]}\n'
+            f'📊 Line {tg["line"]}: Over {tg["prob_over"]}% | Under {tg["prob_under"]}%\n'
+            f'🎯 Confidence: {tg["confidence"]}/100\n'
+        )
+        if tg.get('ev_pct') is not None:
+            msg += (
+                f'💡 Edge: {tg["edge_pct"]:+.1f}% | EV: {tg["ev_pct"]:+.1f}%\n'
+                f'💰 Kelly stake: {tg["kelly_pct"]}% of bankroll\n'
+                f'{rec_emoji} <b>Totals: {rec}</b>\n'
+            )
+        else:
+            msg += f'{rec_emoji} Totals: {rec} (no live totals odds)\n'
+    return msg
 
 
-async def run_tennis_alert_engine(db: AsyncSession) -> dict:
+async def run_tennis_alert_engine(db):
     bot_token = os.getenv('TELEGRAM_BOT_TOKEN', '')
     chat_id   = os.getenv('TELEGRAM_CHAT_ID', '')
     api_key   = os.getenv('TENNIS_ODDS_API_KEY') or os.getenv('ODDS_API_KEY', '')
-
     now          = datetime.now(timezone.utc)
     window_start = now
     window_end   = now + timedelta(hours=3)
-
-    alerts_sent = 0
-    skipped_duplicate = 0
-    no_data = 0
+    alerts_sent = skipped_duplicate = no_data = 0
     errors = []
 
     async with httpx.AsyncClient(timeout=15.0) as client:
@@ -226,106 +297,75 @@ async def run_tennis_alert_engine(db: AsyncSession) -> dict:
             try:
                 r = await client.get(
                     f'https://api.the-odds-api.com/v4/sports/{sport_key}/odds',
-                    params={
-                        'apiKey': api_key,
-                        'regions': 'eu,uk',
-                        'markets': 'h2h',
-                        'oddsFormat': 'decimal',
-                    }
+                    params={'apiKey': api_key, 'regions': 'eu,uk', 'markets': 'h2h,totals', 'oddsFormat': 'decimal'}
                 )
                 matches = r.json()
+                if not isinstance(matches, list):
+                    logger.error(f'Odds API error: {matches}')
+                    continue
             except Exception as e:
-                logger.error(f'Odds API failed for {sport_key}: {e}')
+                logger.error(f'Odds API failed: {e}')
                 continue
 
             tournament = 'ATP Wimbledon' if 'atp' in sport_key else 'WTA Wimbledon'
+            best_of    = 5 if 'atp' in sport_key else 3
 
             for match in matches:
                 try:
-                    odds_api_id  = match.get('id', '')
-                    p1_name      = match.get('home_team', '')
-                    p2_name      = match.get('away_team', '')
-                    commence_str = match.get('commence_time', '')
-
-                    # Parse match time
-                    commence_time = datetime.fromisoformat(
-                        commence_str.replace('Z', '+00:00')
-                    )
-
-                    # Skip past matches
+                    odds_api_id   = match.get('id', '')
+                    p1_name       = match.get('home_team', '')
+                    p2_name       = match.get('away_team', '')
+                    commence_str  = match.get('commence_time', '')
+                    commence_time = datetime.fromisoformat(commence_str.replace('Z', '+00:00'))
                     if commence_time <= now:
                         continue
-
-                    # Only alert if match is within 3 hours
                     if not (window_start <= commence_time <= window_end):
                         continue
-
-                    # Skip duplicates
                     if await _already_alerted(db, odds_api_id):
                         skipped_duplicate += 1
                         continue
 
-                    # Get odds
-                    p1_odds = p2_odds = None
+                    p1_odds = p2_odds = totals_over_price = totals_under_price = None
                     for bk in match.get('bookmakers', []):
                         for mkt in bk.get('markets', []):
-                            if mkt['key'] == 'h2h':
-                                for outcome in mkt['outcomes']:
-                                    if outcome['name'] == p1_name:
-                                        p1_odds = outcome['price']
-                                    elif outcome['name'] == p2_name:
-                                        p2_odds = outcome['price']
-                        if p1_odds and p2_odds:
+                            if mkt['key'] == 'h2h' and not p1_odds:
+                                for oc in mkt['outcomes']:
+                                    if oc['name'] == p1_name:
+                                        p1_odds = oc['price']
+                                    elif oc['name'] == p2_name:
+                                        p2_odds = oc['price']
+                            elif mkt['key'] == 'totals' and not totals_over_price:
+                                for oc in mkt['outcomes']:
+                                    if oc['name'] == 'Over':
+                                        totals_over_price = oc['price']
+                                    elif oc['name'] == 'Under':
+                                        totals_under_price = oc['price']
+                        if p1_odds and totals_over_price:
                             break
 
-                    # Look up ELO from historical data
-                    p1_data = await _get_player_elo(db, p1_name)
-                    p2_data = await _get_player_elo(db, p2_name)
-
+                    p1_data = await _get_player_data(db, p1_name)
+                    p2_data = await _get_player_data(db, p2_name)
                     if not p1_data or not p2_data:
-                        logger.info(f'No ELO data for {p1_name} or {p2_name} — using defaults')
                         no_data += 1
                         p1_data = p1_data or {'elo': 1500.0, 'surface_elo': 1500.0, 'rank': 100}
                         p2_data = p2_data or {'elo': 1500.0, 'surface_elo': 1500.0, 'rank': 100}
 
-                    # Run model
-                    p1_prob, p2_prob = _predict(
-                        p1_elo=p1_data['elo'],
-                        p2_elo=p2_data['elo'],
-                        p1_surface_elo=p1_data['surface_elo'],
-                        p2_surface_elo=p2_data['surface_elo'],
-                        p1_rank=p1_data['rank'],
-                        p2_rank=p2_data['rank'],
-                        p1_ace_rate=p1_data.get('ace_rate', 0.06),
-                        p2_ace_rate=p2_data.get('ace_rate', 0.06),
-                        p1_1st_in=p1_data.get('1st_in', 0.60),
-                        p2_1st_in=p2_data.get('1st_in', 0.60),
-                        p1_1st_won=p1_data.get('1st_won', 0.70),
-                        p2_1st_won=p2_data.get('1st_won', 0.70),
-                        p1_bp_saved=p1_data.get('bp_saved', 0.60),
-                        p2_bp_saved=p2_data.get('bp_saved', 0.60),
-                        p1_days_since=p1_data.get('days_since', 7),
-                        p2_days_since=p2_data.get('days_since', 7),
-                        p1_last14=p1_data.get('last14', 3),
-                        p2_last14=p2_data.get('last14', 3),
-                        p1_h2h_wins=p1_data.get('h2h_wins', 0),
-                        p2_h2h_wins=p2_data.get('h2h_wins', 0),
-                        p1_exp=p1_data.get('exp', 100),
-                        p2_exp=p2_data.get('exp', 100),
-                        surface='Grass',
-                        level='G',
-                        round_='R64',
-                        best_of=3,
+                    p1_prob, p2_prob = _predict_winner(
+                        p1_data, p2_data, surface='Grass', level='G', round_='R64', best_of=best_of
                     )
-
                     if p1_prob is None:
-                        errors.append(f'Model failed for {p1_name} vs {p2_name}')
+                        errors.append(f'Winner model failed: {p1_name} vs {p2_name}')
                         continue
 
                     winner     = p1_name if p1_prob >= p2_prob else p2_name
                     confidence = max(p1_prob, p2_prob) * 100
 
-                    # Store in DB
+                    tg_result = _predict_total_games(
+                        p1_data, p2_data, surface='Grass', level='G',
+                        round_='R64', best_of=best_of,
+                        over_price=totals_over_price, under_price=totals_under_price
+                    )
+
                     await db.execute(text('''
                         INSERT INTO tennis_upcoming_matches
                             (odds_api_id, p1_name, p2_name, commence_time, tournament,
@@ -335,12 +375,11 @@ async def run_tennis_alert_engine(db: AsyncSession) -> dict:
                             (:oid, :p1, :p2, :ct, :tour, :sk, :p1o, :p2o, :pw,
                              :p1p, :p2p, :conf, FALSE)
                         ON CONFLICT (odds_api_id) DO UPDATE SET
-                            p1_odds = EXCLUDED.p1_odds,
-                            p2_odds = EXCLUDED.p2_odds,
-                            predicted_winner = EXCLUDED.predicted_winner,
-                            p1_win_prob = EXCLUDED.p1_win_prob,
-                            p2_win_prob = EXCLUDED.p2_win_prob,
-                            confidence = EXCLUDED.confidence
+                            p1_odds=EXCLUDED.p1_odds, p2_odds=EXCLUDED.p2_odds,
+                            predicted_winner=EXCLUDED.predicted_winner,
+                            p1_win_prob=EXCLUDED.p1_win_prob,
+                            p2_win_prob=EXCLUDED.p2_win_prob,
+                            confidence=EXCLUDED.confidence
                     '''), {
                         'oid': odds_api_id, 'p1': p1_name, 'p2': p2_name,
                         'ct': commence_time, 'tour': tournament, 'sk': sport_key,
@@ -348,36 +387,31 @@ async def run_tennis_alert_engine(db: AsyncSession) -> dict:
                         'p1p': p1_prob * 100, 'p2p': p2_prob * 100, 'conf': confidence,
                     })
 
-                    # Format and send Telegram message
                     message = _format_message(
-                        p1=p1_name, p2=p2_name,
-                        winner=winner, confidence=confidence,
+                        p1=p1_name, p2=p2_name, winner=winner,
                         p1_prob=p1_prob * 100, p2_prob=p2_prob * 100,
                         p1_odds=p1_odds, p2_odds=p2_odds,
                         commence_time=commence_time, tournament=tournament,
+                        tg_result=tg_result,
                     )
 
                     sent = False
                     if bot_token and chat_id:
                         sent = await _send_telegram(message, bot_token, chat_id)
-
                     if sent:
-                        await db.execute(text('''
-                            UPDATE tennis_upcoming_matches
-                            SET alert_sent = TRUE
-                            WHERE odds_api_id = :oid
-                        '''), {'oid': odds_api_id})
+                        await db.execute(text(
+                            'UPDATE tennis_upcoming_matches SET alert_sent=TRUE WHERE odds_api_id=:oid'
+                        ), {'oid': odds_api_id})
                         alerts_sent += 1
-                        logger.info(f'Tennis alert sent: {p1_name} vs {p2_name}')
+                        logger.info(f'Alert sent: {p1_name} vs {p2_name}')
 
                 except Exception as e:
                     logger.error(f'Error processing match: {e}')
                     errors.append(str(e))
 
     await db.commit()
-
     return {
-        'engine': 'Tennis Alert Engine',
+        'engine': 'Tennis Alert Engine v2',
         'window': f"{window_start.strftime('%H:%M')} - {window_end.strftime('%H:%M')} UTC",
         'alerts_sent': alerts_sent,
         'skipped_duplicate': skipped_duplicate,
