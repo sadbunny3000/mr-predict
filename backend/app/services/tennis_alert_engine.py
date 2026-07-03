@@ -347,8 +347,8 @@ async def run_tennis_alert_engine(db):
                     p2_data = await _get_player_data(db, p2_name)
                     if not p1_data or not p2_data:
                         no_data += 1
-                        p1_data = p1_data or {'elo': 1500.0, 'surface_elo': 1500.0, 'rank': 100}
-                        p2_data = p2_data or {'elo': 1500.0, 'surface_elo': 1500.0, 'rank': 100}
+                        logger.info(f"Skipping: no ELO data for {p1_name} or {p2_name}")
+                        continue
 
                     p1_prob, p2_prob = _predict_winner(
                         p1_data, p2_data, surface='Grass', level='G', round_='R64', best_of=best_of
@@ -359,6 +359,11 @@ async def run_tennis_alert_engine(db):
 
                     winner     = p1_name if p1_prob >= p2_prob else p2_name
                     confidence = max(p1_prob, p2_prob) * 100
+
+                    # Skip low confidence matches — model has no meaningful edge
+                    if confidence < 62.0:
+                        logger.info(f"Skipping low confidence: {p1_name} vs {p2_name} ({confidence:.1f}%)")
+                        continue
 
                     tg_result = _predict_total_games(
                         p1_data, p2_data, surface='Grass', level='G',
