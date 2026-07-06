@@ -220,7 +220,42 @@ async def _already_alerted(session, odds_api_id):
         'SELECT alert_sent FROM tennis_upcoming_matches WHERE odds_api_id = :oid AND alert_sent = TRUE'
     ), {'oid': odds_api_id})
     return result.fetchone() is not None
-
+async def _record_clv_opening(db, odds_api_id, p1_name, p2_name, tournament,
+                               surface, best_of, commence_time, tg_result,
+                               totals_over_price, totals_under_price):
+    if not tg_result:
+        return
+    opening_implied_over = None
+    if totals_over_price:
+        implied_over  = 1 / totals_over_price
+        implied_under = 1 / totals_under_price if totals_under_price else None
+        if implied_under:
+            opening_implied_over = implied_over / (implied_over + implied_under)
+    try:
+        await db.execute(text('''
+            INSERT INTO tennis_clv_tracking
+                (odds_api_id, p1_name, p2_name, tournament, surface, best_of,
+                 commence_time, model_line, model_prob_over, model_prob_under,
+                 model_confidence, model_recommendation, model_ev_pct, model_edge_pct,
+                 opening_line, opening_over_price, opening_under_price, opening_implied_over)
+            VALUES
+                (:oid, :p1, :p2, :tour, :surf, :bo,
+                 :ct, :line, :prob_over, :prob_under,
+                 :conf, :rec, :ev, :edge,
+                 :line, :over_price, :under_price, :impl_over)
+            ON CONFLICT DO NOTHING
+        '''), {
+            'oid': odds_api_id, 'p1': p1_name, 'p2': p2_name,
+            'tour': tournament, 'surf': surface, 'bo': best_of,
+            'ct': commence_time, 'line': tg_result.get('line'),
+            'prob_over': tg_result.get('prob_over'), 'prob_under': tg_result.get('prob_under'),
+            'conf': tg_result.get('confidence'), 'rec': tg_result.get('recommendation'),
+            'ev': tg_result.get('ev_pct'), 'edge': tg_result.get('edge_pct'),
+            'over_price': totals_over_price, 'under_price': totals_under_price,
+            'impl_over': opening_implied_over,
+        })
+    except Exception as e:
+        logger.error(f'CLV record failed for {odds_api_id}: {e}')
 
 async def _send_telegram(message, bot_token, chat_id):
     try:
@@ -407,12 +442,13 @@ async def run_tennis_alert_engine(db):
                         await db.execute(text(
                             'UPDATE tennis_upcoming_matches SET alert_sent=TRUE WHERE odds_api_id=:oid'
                         ), {'oid': odds_api_id})
+                        await _record_clv_opening(
+                            db, odds_api_id, p1_name, p2_name, tournament,
+                            'Grass', best_of, commence_time, tg_result,
+                            totals_over_price, totals_under_price
+                        )
                         alerts_sent += 1
                         logger.info(f'Alert sent: {p1_name} vs {p2_name}')
-
-                except Exception as e:
-                    logger.error(f'Error processing match: {e}')
-                    errors.append(str(e))
 
     await db.commit()
     return {
