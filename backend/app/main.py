@@ -9,8 +9,7 @@ from app.config import settings
 from app.redis_client import close_redis
 from app.database import AsyncSessionLocal
 from app.services.alert_engine import run_alert_engine
-from app.services.tennis_alert_engine import run_tennis_alert_engine
-from app.services.tennis_alert_engine import run_tennis_alert_engine
+from app.services.tennis_alert_engine import run_tennis_alert_engine, run_tennis_clv_closing_job
 
 # ─── Logging setup ──────────────────────────────────────────
 logging.basicConfig(
@@ -68,10 +67,25 @@ async def alert_scheduler():
             logger.error(f"Scheduler error: {e}")
 
 
+async def tennis_clv_closing_scheduler():
+    """Check for matches starting soon and record closing odds every 5 minutes."""
+    logger.info("Tennis CLV closing scheduler started — runs every 5 minutes")
+    while True:
+        await asyncio.sleep(300)  # wait 5 minutes
+        try:
+            async with AsyncSessionLocal() as db:
+                result = await run_tennis_clv_closing_job(db)
+                if result.get('checked', 0) > 0:
+                    logger.info(f"Scheduler: tennis CLV closing job done — {result}")
+        except Exception as e:
+            logger.error(f"CLV closing scheduler error: {e}")
+
+
 # ─── Lifecycle ───────────────────────────────────────────────
 @app.on_event("startup")
 async def startup():
     asyncio.create_task(alert_scheduler())
+    asyncio.create_task(tennis_clv_closing_scheduler())
     logger.info("Application started — alert scheduler running")
 
 
