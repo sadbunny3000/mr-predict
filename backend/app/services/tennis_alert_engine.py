@@ -450,6 +450,10 @@ async def run_tennis_alert_engine(db):
                         alerts_sent += 1
                         logger.info(f'Alert sent: {p1_name} vs {p2_name}')
 
+                except Exception as e:
+                    logger.error(f'Error processing match: {e}')
+                    errors.append(str(e))
+
     await db.commit()
     return {
         'engine': 'Tennis Alert Engine v2',
