@@ -220,6 +220,8 @@ async def _already_alerted(session, odds_api_id):
         'SELECT alert_sent FROM tennis_upcoming_matches WHERE odds_api_id = :oid AND alert_sent = TRUE'
     ), {'oid': odds_api_id})
     return result.fetchone() is not None
+
+
 async def _record_clv_opening(db, odds_api_id, p1_name, p2_name, tournament,
                                surface, best_of, commence_time, tg_result,
                                totals_over_price, totals_under_price):
@@ -256,6 +258,86 @@ async def _record_clv_opening(db, odds_api_id, p1_name, p2_name, tournament,
         })
     except Exception as e:
         logger.error(f'CLV record failed for {odds_api_id}: {e}')
+
+
+async def run_tennis_clv_closing_job(db):
+    """Fetch closing odds for matches starting soon and record CLV."""
+    api_key = os.getenv('TENNIS_ODDS_API_KEY') or os.getenv('ODDS_API_KEY', '')
+    now          = datetime.now(timezone.utc)
+    window_start = now
+    window_end   = now + timedelta(minutes=10)
+
+    result = await db.execute(text('''
+        SELECT id, odds_api_id, tournament, best_of,
+               model_recommendation, opening_over_price, opening_under_price, model_line
+        FROM tennis_clv_tracking
+        WHERE closing_line IS NULL
+          AND commence_time BETWEEN :ws AND :we
+    '''), {'ws': window_start, 'we': window_end})
+    rows = result.fetchall()
+    if not rows:
+        return {'checked': 0, 'updated': 0}
+
+    updated = 0
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        for row in rows:
+            row_id, odds_api_id, tournament, best_of, rec, open_over, open_under, model_line = row
+            sport_key = 'tennis_atp_wimbledon' if best_of == 5 else 'tennis_wta_wimbledon'
+            try:
+                r = await client.get(
+                    f'https://api.the-odds-api.com/v4/sports/{sport_key}/events/{odds_api_id}/odds',
+                    params={'apiKey': api_key, 'regions': 'eu,uk', 'markets': 'totals', 'oddsFormat': 'decimal'}
+                )
+                data = r.json()
+                closing_over = closing_under = None
+                for bk in data.get('bookmakers', []):
+                    for mkt in bk.get('markets', []):
+                        if mkt['key'] == 'totals':
+                            for oc in mkt['outcomes']:
+                                if oc['name'] == 'Over':
+                                    closing_over = oc['price']
+                                elif oc['name'] == 'Under':
+                                    closing_under = oc['price']
+                    if closing_over:
+                        break
+                if not closing_over or not closing_under:
+                    continue
+
+                implied_over = 1 / closing_over
+                implied_under = 1 / closing_under
+                closing_implied_over = implied_over / (implied_over + implied_under)
+
+                side = None
+                if rec and 'OVER' in rec.upper():
+                    side = 'Over'
+                elif rec and 'UNDER' in rec.upper():
+                    side = 'Under'
+
+                clv = beat = None
+                if side == 'Over' and open_over:
+                    clv  = (open_over / closing_over - 1) * 100
+                    beat = open_over > closing_over
+                elif side == 'Under' and open_under:
+                    clv  = (open_under / closing_under - 1) * 100
+                    beat = open_under > closing_under
+
+                await db.execute(text('''
+                    UPDATE tennis_clv_tracking
+                    SET closing_line = :cl, closing_over_price = :co,
+                        closing_under_price = :cu, closing_implied_over = :cio,
+                        clv = :clv, beat_closing_line = :beat, updated_at = NOW()
+                    WHERE id = :id
+                '''), {
+                    'cl': model_line, 'co': closing_over, 'cu': closing_under,
+                    'cio': closing_implied_over, 'clv': clv, 'beat': beat, 'id': row_id,
+                })
+                updated += 1
+            except Exception as e:
+                logger.error(f'CLV closing fetch failed for {odds_api_id}: {e}')
+
+    await db.commit()
+    return {'checked': len(rows), 'updated': updated}
+
 
 async def _send_telegram(message, bot_token, chat_id):
     try:
