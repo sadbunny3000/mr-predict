@@ -323,7 +323,7 @@ async def run_tennis_alert_engine(db):
     api_key   = os.getenv('TENNIS_ODDS_API_KEY') or os.getenv('ODDS_API_KEY', '')
     now          = datetime.now(timezone.utc)
     window_start = now
-    window_end   = now + timedelta(hours=3)
+    window_end   = now + timedelta(hours=8)
     alerts_sent = skipped_duplicate = no_data = 0
     errors = []
 
