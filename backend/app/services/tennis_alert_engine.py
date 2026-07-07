@@ -4,6 +4,7 @@ Tennis Alert Engine v2
 - Total games prediction with full probability distribution
 - Real totals odds from The Odds API
 - Never sends duplicates, never alerts on past matches
+- Caches match discovery to reduce Odds API quota usage
 """
 import logging
 import os
@@ -27,6 +28,10 @@ TOTAL_GAMES_LINES = {
     'bo5_Hard': 33.5, 'bo5_Clay': 32.5, 'bo5_Grass': 34.5,
 }
 
+# ─── Match discovery cache (reduces Odds API quota usage) ────
+CACHE_TTL_HOURS = 3
+_match_cache = {}  # sport_key -> {'fetched_at': datetime, 'matches': list}
+
 try:
     with open(WINNER_MODEL_PATH, 'rb') as f:
         _winner_saved = pickle.load(f)
@@ -45,6 +50,32 @@ try:
 except Exception as e:
     _tg_models = None
     logger.error(f'Total games model failed: {e}')
+
+
+async def _get_matches_cached(client, sport_key, api_key):
+    """Fetch matches for a sport_key, using a cached copy if still fresh."""
+    now = datetime.now(timezone.utc)
+    cached = _match_cache.get(sport_key)
+    if cached and (now - cached['fetched_at']) < timedelta(hours=CACHE_TTL_HOURS):
+        age_min = round((now - cached['fetched_at']).total_seconds() / 60)
+        logger.info(f'Using cached matches for {sport_key} (age: {age_min}m)')
+        return cached['matches']
+
+    try:
+        r = await client.get(
+            f'https://api.the-odds-api.com/v4/sports/{sport_key}/odds',
+            params={'apiKey': api_key, 'regions': 'eu,uk', 'markets': 'h2h,totals', 'oddsFormat': 'decimal'}
+        )
+        matches = r.json()
+        if not isinstance(matches, list):
+            logger.error(f'Odds API error: {matches}')
+            return cached['matches'] if cached else []
+        _match_cache[sport_key] = {'fetched_at': now, 'matches': matches}
+        logger.info(f'Fetched fresh matches for {sport_key} ({len(matches)} matches)')
+        return matches
+    except Exception as e:
+        logger.error(f'Odds API failed: {e}')
+        return cached['matches'] if cached else []
 
 
 def _predict_winner(p1_data, p2_data, surface='Grass', level='G', round_='R64', best_of=3):
@@ -411,17 +442,8 @@ async def run_tennis_alert_engine(db):
 
     async with httpx.AsyncClient(timeout=15.0) as client:
         for sport_key in TENNIS_SPORT_KEYS:
-            try:
-                r = await client.get(
-                    f'https://api.the-odds-api.com/v4/sports/{sport_key}/odds',
-                    params={'apiKey': api_key, 'regions': 'eu,uk', 'markets': 'h2h,totals', 'oddsFormat': 'decimal'}
-                )
-                matches = r.json()
-                if not isinstance(matches, list):
-                    logger.error(f'Odds API error: {matches}')
-                    continue
-            except Exception as e:
-                logger.error(f'Odds API failed: {e}')
+            matches = await _get_matches_cached(client, sport_key, api_key)
+            if not matches:
                 continue
 
             tournament = 'ATP Wimbledon' if 'atp' in sport_key else 'WTA Wimbledon'
