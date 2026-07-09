@@ -25,3 +25,4 @@ redis_data/
 
 # Logs
 *.log
+backend/.env
