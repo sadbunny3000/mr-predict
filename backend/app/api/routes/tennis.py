@@ -1,8 +1,11 @@
 import pickle
 import numpy as np
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from typing import Optional
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.database import get_db
+from app.services.tennis_alert_engine import run_tennis_alert_engine
 
 router = APIRouter()
 
@@ -83,3 +86,9 @@ async def tennis_model_status():
         'features': _features,
         'feature_count': len(_features),
     }
+
+@router.post('/tennis/alerts/run')
+async def trigger_tennis_alert_engine(db: AsyncSession = Depends(get_db)):
+    """Manually trigger the tennis alert engine (for testing)."""
+    result = await run_tennis_alert_engine(db)
+    return result
