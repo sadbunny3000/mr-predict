@@ -464,6 +464,71 @@ async def run_tennis_clv_closing_job(db):
  
     await db.commit()
     return {'checked': len(rows), 'updated': updated}
+
+async def run_tennis_result_check_job(db):
+    """Check completed matches against Odds API scores and record winner accuracy."""
+    api_key = os.getenv('TENNIS_ODDS_API_KEY') or os.getenv('ODDS_API_KEY', '')
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=4)  # assume match finished 4+ hours after start
+
+    result = await db.execute(text('''
+        SELECT id, odds_api_id, sport_key, p1_name, p2_name, predicted_winner
+        FROM tennis_upcoming_matches
+        WHERE alert_sent = TRUE AND result_checked = FALSE
+          AND commence_time < :cutoff
+    '''), {'cutoff': cutoff})
+    rows = result.fetchall()
+    if not rows:
+        return {'checked': 0, 'updated': 0}
+
+    rows_by_sport = {}
+    for row in rows:
+        rows_by_sport.setdefault(row[2], []).append(row)
+
+    updated = 0
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        for sport_key, sport_rows in rows_by_sport.items():
+            try:
+                r = await client.get(
+                    f'https://api.the-odds-api.com/v4/sports/{sport_key}/scores/',
+                    params={'apiKey': api_key, 'daysFrom': 3}
+                )
+                events = r.json()
+                if not isinstance(events, list):
+                    logger.error(f'Odds API scores error: {events}')
+                    continue
+            except Exception as e:
+                logger.error(f'Odds API scores fetch failed: {e}')
+                continue
+
+            events_by_id = {e.get('id'): e for e in events}
+
+            for row in sport_rows:
+                row_id, odds_api_id, _, p1_name, p2_name, predicted_winner = row
+                event = events_by_id.get(odds_api_id)
+                if not event or not event.get('completed'):
+                    continue
+                scores = event.get('scores')
+                if not scores:
+                    continue
+                try:
+                    parsed = [(s['name'], int(s['score'])) for s in scores]
+                except (KeyError, ValueError, TypeError):
+                    continue
+                if len(parsed) != 2 or parsed[0][1] == parsed[1][1]:
+                    continue
+                actual_winner = max(parsed, key=lambda x: x[1])[0]
+                winner_correct = (actual_winner == predicted_winner)
+
+                await db.execute(text('''
+                    UPDATE tennis_upcoming_matches
+                    SET actual_winner = :aw, winner_correct = :wc, result_checked = TRUE
+                    WHERE id = :id
+                '''), {'aw': actual_winner, 'wc': winner_correct, 'id': row_id})
+                updated += 1
+
+    await db.commit()
+    return {'checked': len(rows), 'updated': updated}
  
  
 async def _send_telegram(message, bot_token, chat_id):
