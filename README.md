@@ -226,7 +226,3 @@ Built as a solo project combining sports analytics, machine learning, and quanti
 This project is for **educational and research purposes only**. Predictions are probabilistic and not financial advice. Always gamble responsibly.
 
 ---
-
-## 📄 License
-
-MIT License — see [LICENSE](LICENSE) for details.
