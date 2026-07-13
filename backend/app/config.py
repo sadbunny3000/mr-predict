@@ -30,6 +30,7 @@ class Settings(BaseSettings):
 
     # ─── Odds API ────────────────────────────────────────────
     odds_api_key: str = ""
+    tennis_odds_api_key: str = ""
     odds_api_base_url: str = "https://api.the-odds-api.com/v4"
 
     # ─── Telegram ────────────────────────────────────────────

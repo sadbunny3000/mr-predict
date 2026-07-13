@@ -1,2 +1,7 @@
 
 # Allow saved models
+
+# Data dumps and archives — never commit these
+*.sql
+*.zip
+tennis_kaggle/
