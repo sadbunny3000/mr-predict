@@ -6,10 +6,11 @@ from typing import Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.services.tennis_alert_engine import run_tennis_alert_engine
+from tennis.ingestion.sackmann_ingestion import SackmannIngestion
+from tennis.features.rebuild import run_full_feature_rebuild
 
 router = APIRouter()
 
-# Load model once when the route file is imported
 try:
     with open('/app/ml/saved_models/tennis_winner_model.pkl', 'rb') as f:
         _saved = pickle.load(f)
@@ -32,6 +33,9 @@ class TennisPredictionRequest(BaseModel):
     tourney_level: str = 'A'
     round: str = 'R32'
     best_of: int = 3
+
+class TennisIngestRequest(BaseModel):
+    year: int
 
 @router.post('/tennis/predict')
 async def tennis_predict(req: TennisPredictionRequest):
@@ -91,4 +95,25 @@ async def tennis_model_status():
 async def trigger_tennis_alert_engine(db: AsyncSession = Depends(get_db)):
     """Manually trigger the tennis alert engine (for testing)."""
     result = await run_tennis_alert_engine(db)
+    return result
+
+@router.post('/tennis/ingest/run')
+async def trigger_tennis_ingestion(req: TennisIngestRequest, db: AsyncSession = Depends(get_db)):
+    """Manually trigger a live ingestion pull from JeffSackmann/tennis_atp on GitHub
+    for a given season. Upserts, so safe to re-run against a season already in the DB."""
+    ingestion = SackmannIngestion(db)
+    try:
+        result = await ingestion.ingest_season_from_github(req.year)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"GitHub ingestion failed: {e}")
+    return result
+
+@router.post('/tennis/features/rebuild')
+async def trigger_feature_rebuild(db: AsyncSession = Depends(get_db)):
+    """Manually trigger a full feature rebuild (Elo/serve-stats + rolling windows)
+    after new match data has landed. Safe to re-run — everything upserts."""
+    try:
+        result = await run_full_feature_rebuild(db)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Feature rebuild failed: {e}")
     return result
