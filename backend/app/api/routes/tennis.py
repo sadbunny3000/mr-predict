@@ -1,4 +1,7 @@
+import os
 import pickle
+import asyncio
+from datetime import datetime, timezone
 import numpy as np
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
@@ -7,7 +10,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.services.tennis_alert_engine import run_tennis_alert_engine
 from tennis.ingestion.sackmann_ingestion import SackmannIngestion
-from tennis.features.rebuild import run_full_feature_rebuild
+from tennis.features.rebuild import run_full_feature_rebuild, _get_sync_database_url
+from tennis.training.retrain_total_games import train_total_games_candidate
 
 router = APIRouter()
 
@@ -36,6 +40,9 @@ class TennisPredictionRequest(BaseModel):
 
 class TennisIngestRequest(BaseModel):
     year: int
+
+class TennisRetrainRequest(BaseModel):
+    test_cutoff_date: str = '2023-01-01'
 
 @router.post('/tennis/predict')
 async def tennis_predict(req: TennisPredictionRequest):
@@ -116,4 +123,28 @@ async def trigger_feature_rebuild(db: AsyncSession = Depends(get_db)):
         result = await run_full_feature_rebuild(db)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Feature rebuild failed: {e}")
+    return result
+
+@router.post('/tennis/retrain/run')
+async def trigger_retrain_candidate(req: TennisRetrainRequest):
+    """Retrains the total-games quantile models (GBR/XGBoost/LightGBM per
+    segment) on current data and saves the result to a timestamped CANDIDATE
+    file under ml/saved_models/candidates/. Does NOT touch the live model —
+    review the returned per-segment metrics, then promote manually by
+    copying the candidate file over tennis_total_games_model_v4_ensemble.pkl
+    yourself once you're satisfied it's an improvement."""
+    candidates_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'ml', 'saved_models', 'candidates')
+    os.makedirs(candidates_dir, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+    candidate_path = os.path.join(candidates_dir, f'tennis_total_games_candidate_{timestamp}.pkl')
+
+    try:
+        result = await asyncio.to_thread(
+            train_total_games_candidate,
+            _get_sync_database_url(),
+            candidate_path,
+            req.test_cutoff_date,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Retrain failed: {e}")
     return result

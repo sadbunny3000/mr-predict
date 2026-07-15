@@ -1,6 +1,7 @@
 import logging
 import sys
 import asyncio
+from datetime import datetime, timezone
 import structlog
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,6 +11,8 @@ from app.redis_client import close_redis
 from app.database import AsyncSessionLocal
 from app.services.alert_engine import run_alert_engine
 from app.services.tennis_alert_engine import run_tennis_alert_engine, run_tennis_clv_closing_job, run_tennis_result_check_job
+from tennis.ingestion.sackmann_ingestion import SackmannIngestion
+from tennis.features.rebuild import run_full_feature_rebuild
 
 # ─── Logging setup ──────────────────────────────────────────
 logging.basicConfig(
@@ -94,12 +97,35 @@ async def tennis_result_check_scheduler():
             logger.error(f"Result-check scheduler error: {e}")
 
 
+async def tennis_data_refresh_scheduler():
+    """Weekly continuous-learning refresh: pulls the current season from
+    JeffSackmann/tennis_atp on GitHub, then rebuilds Elo/serve-stat and
+    rolling-window features on top of it. Everything upserts, so this is
+    safe to run repeatedly. Does NOT retrain or touch the live model —
+    that stays a separate manual step (see /tennis/retrain/run)."""
+    logger.info("Tennis data-refresh scheduler started — runs every 7 days")
+    while True:
+        await asyncio.sleep(604800)  # wait 7 days
+        try:
+            current_year = datetime.now(timezone.utc).year
+            async with AsyncSessionLocal() as db:
+                ingestion = SackmannIngestion(db)
+                ingest_result = await ingestion.ingest_season_from_github(current_year)
+                logger.info(f"Scheduler: tennis data refresh — ingest done — {ingest_result}")
+
+                rebuild_result = await run_full_feature_rebuild(db)
+                logger.info(f"Scheduler: tennis data refresh — feature rebuild done — {rebuild_result}")
+        except Exception as e:
+            logger.error(f"Tennis data-refresh scheduler error: {e}")
+
+
 # ─── Lifecycle ───────────────────────────────────────────────
 @app.on_event("startup")
 async def startup():
     asyncio.create_task(alert_scheduler())
     asyncio.create_task(tennis_clv_closing_scheduler())
     asyncio.create_task(tennis_result_check_scheduler())
+    asyncio.create_task(tennis_data_refresh_scheduler())
     logger.info("Application started — alert scheduler running")
 
 
