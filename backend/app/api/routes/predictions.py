@@ -1,4 +1,5 @@
 import logging
+from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -6,7 +7,7 @@ from sqlalchemy.orm import selectinload
 
 from app.database import get_db
 from app.models.match import Match
-from app.models.prediction import Prediction
+from app.models.prediction import Prediction, Odds
 from app.schemas.prediction import PredictRequestSchema, PredictionSchema
 from app.services.prediction_service import prediction_service
 
@@ -25,6 +26,62 @@ async def get_predictions(
         .limit(limit)
     )
     return result.scalars().all()
+
+
+@router.get("/upcoming")
+async def get_upcoming_predictions(limit: int = 50, db: AsyncSession = Depends(get_db)):
+    """Upcoming football matches with predictions, latest odds snapshot, and
+    the four prop fields (corners/throw-ins) — those come back as null until
+    a model that predicts them actually exists."""
+    now = datetime.now(timezone.utc)
+    result = await db.execute(
+        select(Match, Prediction)
+        .join(Prediction, Prediction.match_id == Match.id)
+        .options(selectinload(Match.home_team), selectinload(Match.away_team))
+        .where(Match.status == "NS", Match.match_date >= now)
+        .order_by(Match.match_date)
+        .limit(limit)
+    )
+    rows = result.all()
+
+    match_ids = [m.id for m, _ in rows]
+    latest_odds = {}
+    if match_ids:
+        odds_result = await db.execute(
+            select(Odds).where(Odds.match_id.in_(match_ids)).order_by(Odds.recorded_at.desc())
+        )
+        for o in odds_result.scalars().all():
+            if o.match_id not in latest_odds:
+                latest_odds[o.match_id] = o
+
+    outcome_map = {"H": "home_win", "D": "draw", "A": "away_win"}
+    data = []
+    for match, pred in rows:
+        odds = latest_odds.get(match.id)
+        probs = [pred.home_win_prob, pred.draw_prob, pred.away_win_prob]
+        confidence = max([p for p in probs if p is not None], default=None)
+        data.append({
+            "id": match.id,
+            "home_team": match.home_team.name,
+            "away_team": match.away_team.name,
+            "competition": match.league_name,
+            "round_label": match.season,
+            "match_date": match.match_date,
+            "market_odds": {
+                "home": odds.home_odds if odds else None,
+                "draw": odds.draw_odds if odds else None,
+                "away": odds.away_odds if odds else None,
+            },
+            "model_confidence": confidence,
+            "predicted_result": outcome_map.get(pred.predicted_outcome),
+            "props": {
+                "total_corners": pred.corners_ft_pred,
+                "corners_first_half": pred.corners_ht_pred,
+                "corners_second_half": pred.corners_2h_pred,
+                "total_throw_ins": pred.throw_ins_pred,
+            },
+        })
+    return data
 
 
 @router.get("/{match_id}", response_model=PredictionSchema)
@@ -57,42 +114,3 @@ async def predict_match(
     except Exception as e:
         logger.exception(f"Prediction failed for match {request.match_api_id}")
         raise HTTPException(status_code=500, detail=f"Prediction error: {str(e)}")
-
-
-@router.post("/predict-all", response_model=dict)
-async def predict_all_upcoming(db: AsyncSession = Depends(get_db)):
-    """Run predictions for all upcoming (NS) matches that don't have one yet."""
-    result = await db.execute(
-        select(Match)
-        .options(selectinload(Match.home_team), selectinload(Match.away_team))
-        .where(Match.status == "NS")
-        .order_by(Match.match_date)
-        .limit(20)
-    )
-    matches = result.scalars().all()
-
-    if not matches:
-        return {"message": "No upcoming matches found", "predicted": 0}
-
-    success = 0
-    failed = 0
-    errors = []
-
-    for match in matches:
-        try:
-            await prediction_service.predict_for_match(
-                match_api_id=match.api_id,
-                db=db,
-            )
-            success += 1
-        except Exception as e:
-            failed += 1
-            errors.append(f"Match {match.api_id}: {str(e)}")
-            logger.warning(f"Failed to predict match {match.api_id}: {e}")
-
-    return {
-        "message": f"Predicted {success} matches, {failed} failed",
-        "predicted": success,
-        "failed": failed,
-        "errors": errors[:5],
-    }

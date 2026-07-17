@@ -6,6 +6,7 @@ import numpy as np
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from typing import Optional
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.services.tennis_alert_engine import run_tennis_alert_engine
@@ -129,10 +130,7 @@ async def trigger_feature_rebuild(db: AsyncSession = Depends(get_db)):
 async def trigger_retrain_candidate(req: TennisRetrainRequest):
     """Retrains the total-games quantile models (GBR/XGBoost/LightGBM per
     segment) on current data and saves the result to a timestamped CANDIDATE
-    file under ml/saved_models/candidates/. Does NOT touch the live model —
-    review the returned per-segment metrics, then promote manually by
-    copying the candidate file over tennis_total_games_model_v4_ensemble.pkl
-    yourself once you're satisfied it's an improvement."""
+    file under ml/saved_models/candidates/. Does NOT touch the live model."""
     candidates_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'ml', 'saved_models', 'candidates')
     os.makedirs(candidates_dir, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
@@ -148,3 +146,46 @@ async def trigger_retrain_candidate(req: TennisRetrainRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Retrain failed: {e}")
     return result
+
+@router.get('/tennis/predictions/upcoming')
+async def get_tennis_upcoming_predictions(limit: int = 50, db: AsyncSession = Depends(get_db)):
+    """Upcoming tennis matches that cleared the alert engine's 62% confidence
+    bar (that's the only reason a row exists in tennis_upcoming_matches at all).
+    total_games fields are only populated for matches where an alert was
+    actually sent — the alert engine doesn't persist that calculation otherwise."""
+    now = datetime.now(timezone.utc)
+    result = await db.execute(text('''
+        SELECT u.odds_api_id, u.p1_name, u.p2_name, u.tournament, u.sport_key,
+               u.commence_time, u.p1_odds, u.p2_odds, u.predicted_winner,
+               u.p1_win_prob, u.p2_win_prob, u.confidence, u.alert_sent,
+               c.model_line, c.model_prob_over, c.model_prob_under
+        FROM tennis_upcoming_matches u
+        LEFT JOIN tennis_clv_tracking c ON c.odds_api_id = u.odds_api_id
+        WHERE u.commence_time >= :now
+        ORDER BY u.commence_time ASC
+        LIMIT :limit
+    '''), {'now': now, 'limit': limit})
+    rows = result.fetchall()
+
+    data = []
+    for r in rows:
+        (odds_api_id, p1, p2, tournament, sport_key, commence_time,
+         p1_odds, p2_odds, predicted_winner, p1_prob, p2_prob, confidence,
+         alert_sent, model_line, prob_over, prob_under) = r
+        data.append({
+            'id': odds_api_id,
+            'player1': p1,
+            'player2': p2,
+            'tour': 'ATP' if 'atp' in sport_key else 'WTA',
+            'tournament': tournament,
+            'commence_time': commence_time,
+            'market_odds': {'p1': p1_odds, 'p2': p2_odds},
+            'model_prob': {'p1': p1_prob, 'p2': p2_prob},
+            'predicted_winner': 'player1' if predicted_winner == p1 else 'player2',
+            'confidence': confidence,
+            'is_alert': alert_sent,
+            'total_games_line': model_line,
+            'prob_over': prob_over,
+            'prob_under': prob_under,
+        })
+    return data
