@@ -51,6 +51,7 @@ app.include_router(matches.router, prefix="/api/v1")
 app.include_router(predictions.router, prefix="/api/v1")
 app.include_router(alerts.router, prefix="/api/v1")
 app.include_router(dashboard.router, prefix="/api/v1")
+app.include_router(tennis.router, prefix="/api/v1")
 
 
 # ─── Scheduler ───────────────────────────────────────────────
