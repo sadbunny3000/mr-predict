@@ -5,8 +5,6 @@ import {
   mockAlertHistory,
 } from './mockData.js'
 
-// Set this in a .env file as VITE_API_BASE_URL once Railway is back online,
-// e.g. VITE_API_BASE_URL=https://authentic-flow-production-9812.up.railway.app
 const API_BASE = import.meta.env.VITE_API_BASE_URL || ''
 
 async function fetchJson(path) {
@@ -19,14 +17,6 @@ async function fetchJson(path) {
   }
   return res.json()
 }
-
-// TODO: point these at real read-endpoints once they exist on the backend.
-// None of the four endpoints below exist yet — this whole app currently
-// runs on mock data only. Planned routes (not yet built):
-//   GET /api/v1/tennis/predictions/upcoming
-//   GET /api/v1/football/predictions/upcoming
-//   GET /api/v1/tennis/alerts/history   (or a combined /alerts/history)
-//   GET /api/v1/accuracy
 
 export async function getAccuracy() {
   try {
@@ -46,7 +36,7 @@ export async function getTennisMatches() {
 
 export async function getFootballMatches() {
   try {
-    return await fetchJson('/api/v1/football/predictions/upcoming')
+    return await fetchJson('/api/v1/predictions/upcoming')
   } catch {
     return mockFootballMatches
   }
@@ -58,4 +48,17 @@ export async function getAlertHistory() {
   } catch {
     return mockAlertHistory
   }
+}
+
+export async function predictMatchup(payload) {
+  const res = await fetch(`${API_BASE}/api/v1/tennis/predict/matchup`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+  const data = await res.json()
+  if (!res.ok) {
+    throw new Error(data.detail || `Request failed: ${res.status}`)
+  }
+  return data
 }

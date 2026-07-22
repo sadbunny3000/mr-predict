@@ -9,7 +9,13 @@ from typing import Optional
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
-from app.services.tennis_alert_engine import run_tennis_alert_engine
+from app.services.tennis_alert_engine import (
+    run_tennis_alert_engine,
+    _get_player_data,
+    _get_rolling_features,
+    _predict_winner,
+    _predict_total_games,
+)
 from tennis.ingestion.sackmann_ingestion import SackmannIngestion
 from tennis.features.rebuild import run_full_feature_rebuild, _get_sync_database_url
 from tennis.training.retrain_total_games import train_total_games_candidate
@@ -44,6 +50,14 @@ class TennisIngestRequest(BaseModel):
 
 class TennisRetrainRequest(BaseModel):
     test_cutoff_date: str = '2023-01-01'
+
+class TennisMatchupRequest(BaseModel):
+    p1_name: str
+    p2_name: str
+    surface: str = 'Hard'
+    level: str = 'A'
+    round: str = 'R32'
+    best_of: int = 3
 
 @router.post('/tennis/predict')
 async def tennis_predict(req: TennisPredictionRequest):
@@ -89,6 +103,49 @@ async def tennis_predict(req: TennisPredictionRequest):
         'confidence': round(confidence * 100, 1),
         'p1_win_probability': round(prob_p1 * 100, 1),
         'p2_win_probability': round(prob_p2 * 100, 1),
+    }
+
+@router.post('/tennis/predict/matchup')
+async def predict_matchup(req: TennisMatchupRequest, db: AsyncSession = Depends(get_db)):
+    """Predict a real matchup using each player's actual historical data —
+    Elo, rank, surface-Elo, and rolling serve stats pulled from tennis_matches.
+    No live odds needed, no Telegram send. Player names are matched loosely
+    (by last name) against your historical data, same as the alert engine."""
+    p1_data = await _get_player_data(db, req.p1_name)
+    p2_data = await _get_player_data(db, req.p2_name)
+    if not p1_data or not p2_data:
+        missing = req.p1_name if not p1_data else req.p2_name
+        raise HTTPException(status_code=404, detail=f"No historical match data found for '{missing}'")
+
+    match_date = datetime.now(timezone.utc).date()
+    p1_data['rolling'] = await _get_rolling_features(db, p1_data['player_id'], match_date, req.surface)
+    p2_data['rolling'] = await _get_rolling_features(db, p2_data['player_id'], match_date, req.surface)
+
+    p1_prob, p2_prob = _predict_winner(
+        p1_data, p2_data, surface=req.surface, level=req.level, round_=req.round, best_of=req.best_of
+    )
+    if p1_prob is None:
+        raise HTTPException(status_code=503, detail="Winner model not loaded")
+
+    winner = req.p1_name if p1_prob >= p2_prob else req.p2_name
+    tg_result = _predict_total_games(
+        p1_data, p2_data, surface=req.surface, level=req.level, round_=req.round, best_of=req.best_of
+    )
+
+    return {
+        'p1': req.p1_name,
+        'p2': req.p2_name,
+        'p1_matched_name': p1_data['name'],
+        'p2_matched_name': p2_data['name'],
+        'p1_elo': round(p1_data['elo'], 1),
+        'p2_elo': round(p2_data['elo'], 1),
+        'p1_rank': p1_data['rank'],
+        'p2_rank': p2_data['rank'],
+        'predicted_winner': winner,
+        'p1_win_probability': round(p1_prob * 100, 1),
+        'p2_win_probability': round(p2_prob * 100, 1),
+        'confidence': round(max(p1_prob, p2_prob) * 100, 1),
+        'total_games': tg_result,
     }
 
 @router.get('/tennis/model/status')

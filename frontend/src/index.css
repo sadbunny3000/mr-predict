@@ -318,3 +318,62 @@ h1 {
   color: var(--parchment-dim);
   padding: 24px 0;
 }
+
+.matchup-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+}
+
+.matchup-input {
+  flex: 1;
+  min-width: 140px;
+  background: var(--ink);
+  border: 1px solid var(--hairline);
+  border-radius: 6px;
+  padding: 8px 10px;
+  color: var(--parchment);
+  font-family: 'Inter', sans-serif;
+  font-size: 13px;
+}
+
+.matchup-select {
+  background: var(--ink);
+  border: 1px solid var(--hairline);
+  border-radius: 6px;
+  padding: 8px 10px;
+  color: var(--parchment);
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 12px;
+}
+
+.matchup-submit {
+  background: var(--tennis);
+  color: #1B1F0E;
+  border: none;
+  border-radius: 6px;
+  padding: 8px 16px;
+  font-family: 'Space Grotesk', sans-serif;
+  font-weight: 500;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.matchup-submit:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.matchup-error {
+  margin-top: 12px;
+  color: var(--signal);
+  font-size: 13px;
+  font-family: 'IBM Plex Mono', monospace;
+}
+
+.matchup-result {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--hairline);
+}

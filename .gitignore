@@ -26,3 +26,8 @@ redis_data/
 # Logs
 *.log
 backend/.env
+
+# Frontend build artifacts and dependencies
+frontend/node_modules/
+frontend/dist/
+frontend/.env
